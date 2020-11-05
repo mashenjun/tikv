@@ -28,7 +28,7 @@ use std::u64;
 
 use concurrency_manager::{ConcurrencyManager, KeyHandleGuard};
 use kvproto::kvrpcpb::{CommandPri, ExtraOp};
-use tikv_util::{callback::must_call, collections::HashMap, time::Instant};
+use tikv_util::{callback::must_call, collections::HashMap, time::Instant, trace::*};
 use txn_types::TimeStamp;
 
 use crate::storage::kv::{
@@ -554,43 +554,47 @@ impl<E: Engine, L: LockManager> Scheduler<E, L> {
         self.get_sched_pool(task.cmd.priority())
             .clone()
             .pool
-            .spawn(async move {
-                fail_point!("scheduler_async_snapshot_finish");
-                SCHED_STAGE_COUNTER_VEC.get(tag).process.inc();
+            .spawn(
+                async move {
+                    fail_point!("scheduler_async_snapshot_finish");
+                    SCHED_STAGE_COUNTER_VEC.get(tag).process.inc();
 
-                let read_duration = Instant::now_coarse();
+                    let read_duration = Instant::now_coarse();
 
-                let region_id = task.cmd.ctx().get_region_id();
-                let ts = task.cmd.ts();
-                let timer = Instant::now_coarse();
-                let mut statistics = Statistics::default();
+                    let region_id = task.cmd.ctx().get_region_id();
+                    let ts = task.cmd.ts();
+                    let timer = Instant::now_coarse();
+                    let mut statistics = Statistics::default();
 
-                if task.cmd.readonly() {
-                    self.process_read(snapshot, task, &mut statistics);
-                } else {
-                    // Safety: `self.sched_pool` ensures a TLS engine exists.
-                    unsafe {
-                        with_tls_engine(|engine| {
-                            self.process_write(engine, snapshot, task, &mut statistics)
-                        });
-                    }
-                };
-                tls_collect_scan_details(tag.get_str(), &statistics);
-                slow_log!(
-                    timer.elapsed(),
-                    "[region {}] scheduler handle command: {}, ts: {}",
-                    region_id,
-                    tag,
-                    ts
-                );
+                    if task.cmd.readonly() {
+                        self.process_read(snapshot, task, &mut statistics);
+                    } else {
+                        // Safety: `self.sched_pool` ensures a TLS engine exists.
+                        unsafe {
+                            with_tls_engine(|engine| {
+                                self.process_write(engine, snapshot, task, &mut statistics)
+                            });
+                        }
+                    };
+                    tls_collect_scan_details(tag.get_str(), &statistics);
+                    slow_log!(
+                        timer.elapsed(),
+                        "[region {}] scheduler handle command: {}, ts: {}",
+                        region_id,
+                        tag,
+                        ts
+                    );
 
-                tls_collect_read_duration(tag.get_str(), read_duration.elapsed());
-            })
+                    tls_collect_read_duration(tag.get_str(), read_duration.elapsed());
+                }
+                .with_scope(Scope::child("Scheduler.process_by_worker")),
+            )
             .unwrap();
     }
 
     /// Processes a read command within a worker thread, then posts `ReadFinished` message back to the
     /// `Scheduler`.
+    #[trace("Scheduler::process_read")]
     fn process_read(self, snapshot: E::Snap, task: Task, statistics: &mut Statistics) {
         fail_point!("txn_before_process_read");
         debug!("process read cmd in worker pool"; "cid" => task.cid);
@@ -606,6 +610,7 @@ impl<E: Engine, L: LockManager> Scheduler<E, L> {
 
     /// Processes a write command within a worker thread, then posts either a `WriteFinished`
     /// message if successful or a `FinishedWithErr` message back to the `Scheduler`.
+    #[trace("Scheduler::process_write")]
     fn process_write(self, engine: &E, snapshot: E::Snap, task: Task, statistics: &mut Statistics) {
         fail_point!("txn_before_process_write");
         let tag = task.cmd.tag();

@@ -41,6 +41,7 @@ use tikv_util::{escape, HandyRwLock};
 use super::*;
 
 use engine_traits::{ALL_CFS, CF_DEFAULT, CF_RAFT};
+use raftstore::store::msg::TracedMsg;
 pub use raftstore::store::util::{find_peer, new_learner_peer, new_peer};
 use tikv_util::time::ThreadReadId;
 
@@ -581,7 +582,7 @@ pub fn create_test_engine(
             router
                 .lock()
                 .unwrap()
-                .send_control(StoreMsg::CompactedEvent(event))
+                .send_control(TracedMsg::new_not_traced(StoreMsg::CompactedEvent(event)))
                 .unwrap();
         });
         kv_db_opt.add_event_listener(CompactionListener::new(

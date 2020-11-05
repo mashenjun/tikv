@@ -1,6 +1,7 @@
 // Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::cmp::{Ord, Ordering as CmpOrdering};
 use std::collections::VecDeque;
 use std::fmt::{self, Debug, Formatter};
@@ -41,6 +42,7 @@ use tikv_util::collections::{HashMap, HashMapEntry, HashSet};
 use tikv_util::config::{Tracker, VersionTrack};
 use tikv_util::mpsc::{loose_bounded, LooseBoundedSender, Receiver};
 use tikv_util::time::{duration_to_sec, Instant};
+use tikv_util::trace::*;
 use tikv_util::worker::Scheduler;
 use tikv_util::{Either, MustConsumeVec};
 use time::Timespec;
@@ -453,6 +455,7 @@ where
 
     /// Writes all the changes into RocksDB.
     /// If it returns true, all pending writes are persisted in engines.
+    #[trace("ApplyContext::write_to_db")]
     pub fn write_to_db(&mut self) -> bool {
         let need_sync = self.sync_log_hint;
         if !self.kv_wb_mut().is_empty() {
@@ -528,6 +531,7 @@ where
 
     /// Flush all pending writes to engines.
     /// If it returns true, all pending writes are persisted in engines.
+    #[trace("ApplyContext::flush")]
     pub fn flush(&mut self) -> bool {
         // TODO: this check is too hacky, need to be more verbose and less buggy.
         let t = match self.timer.take() {
@@ -2740,6 +2744,7 @@ where
     /// `renew_lease_time` contains the last time when a peer starts to renew lease.
     pub renew_lease_time: Option<Timespec>,
     pub must_pass_epoch_check: bool,
+    pub trace_scopes: Vec<Scope>,
 }
 
 pub struct Destroy {
@@ -3020,6 +3025,7 @@ where
     }
 
     /// Handles apply tasks, and uses the apply delegate to handle the committed entries.
+    #[trace("ApplyFsm::handle_apply")]
     fn handle_apply<W: WriteBatch<EK>>(
         &mut self,
         apply_ctx: &mut ApplyContext<EK, W>,
@@ -3354,6 +3360,12 @@ where
         loop {
             match drainer.next() {
                 Some(Msg::Apply { start, apply }) => {
+                    TRACE_GUARD.with(|g| {
+                        g.set(Some(start_scopes(
+                            apply.cbs.iter().map(|p| p.trace_scopes.iter()).flatten(),
+                        )))
+                    });
+
                     if channel_timer.is_none() {
                         channel_timer = Some(start);
                     }
@@ -3449,6 +3461,10 @@ where
     cfg_tracker: Tracker<Config>,
 }
 
+thread_local! {
+    static TRACE_GUARD: Cell<Option<LocalScopeGuard>> = Cell::new(None);
+}
+
 impl<EK, W> PollHandler<ApplyFsm<EK>, ControlFsm> for ApplyPoller<EK, W>
 where
     EK: KvEngine,
@@ -3535,6 +3551,7 @@ where
                 fsm.delegate.last_sync_apply_index = fsm.delegate.apply_state.get_applied_index();
             }
         }
+        TRACE_GUARD.with(|g| g.set(None));
     }
 }
 
@@ -3945,6 +3962,7 @@ mod tests {
             cb,
             renew_lease_time: None,
             must_pass_epoch_check: false,
+            trace_scopes: vec![],
         }
     }
 

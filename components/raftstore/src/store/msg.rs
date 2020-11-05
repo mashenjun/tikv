@@ -21,6 +21,7 @@ use crate::store::metrics::RaftEventDurationType;
 use crate::store::util::KeysInfoFormatter;
 use crate::store::SnapKey;
 use tikv_util::escape;
+use tikv_util::trace::Scope;
 
 use super::{AbstractPeer, RegionSnapshot};
 
@@ -413,6 +414,33 @@ impl<S: Snapshot> RaftCommand<S> {
             callback,
             send_time: Instant::now(),
         }
+    }
+}
+
+pub struct TracedMsg<M> {
+    pub trace_scope: Scope,
+    pub msg: M,
+}
+
+impl<M> TracedMsg<M> {
+    pub fn new(message: M, trace_event_name: &'static str) -> Self {
+        Self {
+            trace_scope: Scope::child(trace_event_name),
+            msg: message,
+        }
+    }
+
+    pub fn new_not_traced(message: M) -> Self {
+        Self {
+            trace_scope: Scope::empty(),
+            msg: message,
+        }
+    }
+}
+
+impl<T: std::fmt::Debug> std::fmt::Debug for TracedMsg<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.msg.fmt(f)
     }
 }
 

@@ -16,6 +16,7 @@ use tikv::import::SSTImporter;
 
 use concurrency_manager::ConcurrencyManager;
 use engine_traits::{Engines, ALL_CFS};
+use raftstore::store::msg::TracedMsg;
 use tempfile::TempDir;
 use test_raftstore::TestPdClient;
 use tikv_util::config::VersionTrack;
@@ -122,10 +123,12 @@ where
 {
     let (tx, rx) = mpsc::channel();
     router
-        .send_control(StoreMsg::Validate(Box::new(move |cfg: &Config| {
-            f(cfg);
-            tx.send(()).unwrap();
-        })))
+        .send_control(TracedMsg::new_not_traced(StoreMsg::Validate(Box::new(
+            move |cfg: &Config| {
+                f(cfg);
+                tx.send(()).unwrap();
+            },
+        ))))
         .unwrap();
     rx.recv_timeout(Duration::from_secs(3)).unwrap();
 }

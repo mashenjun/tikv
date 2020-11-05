@@ -47,6 +47,7 @@ use raftstore::{
 };
 use raftstore::{coprocessor::ReadIndexObserver, errors::Error as RaftServerError};
 use tikv_util::time::Instant;
+use tikv_util::trace::*;
 
 quick_error! {
     #[derive(Debug)]
@@ -161,6 +162,7 @@ fn check_raft_cmd_response(resp: &mut RaftCmdResponse, req_cnt: usize) -> Result
     Ok(())
 }
 
+#[trace("RaftKv::on_write_result")]
 fn on_write_result(mut write_resp: WriteResponse, req_cnt: usize) -> (CbContext, Result<CmdRes>) {
     let cb_ctx = new_ctx(&write_resp.response);
     if let Err(e) = check_raft_cmd_response(&mut write_resp.response, req_cnt) {
@@ -170,6 +172,7 @@ fn on_write_result(mut write_resp: WriteResponse, req_cnt: usize) -> (CbContext,
     (cb_ctx, Ok(CmdRes::Resp(resps.into())))
 }
 
+#[trace("RaftKv::on_read_result")]
 fn on_read_result(
     mut read_resp: ReadResponse<RocksSnapshot>,
     req_cnt: usize,
@@ -239,6 +242,7 @@ where
             .map_err(From::from)
     }
 
+    #[trace("RaftKv::exec_write_requests")]
     fn exec_write_requests(
         &self,
         ctx: &Context,
@@ -361,6 +365,7 @@ where
         write_modifies(&self.engine, modifies)
     }
 
+    #[trace("RaftKv::async_write")]
     fn async_write(
         &self,
         ctx: &Context,
@@ -460,6 +465,7 @@ where
         })
     }
 
+    #[trace("RaftKv::async_snapshot")]
     fn async_snapshot(&self, mut ctx: SnapContext<'_>, cb: Callback<Self::Snap>) -> kv::Result<()> {
         fail_point!("raftkv_async_snapshot_err", |_| Err(box_err!(
             "injected error for async_snapshot"

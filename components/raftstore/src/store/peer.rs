@@ -48,6 +48,7 @@ use pd_client::INVALID_ID;
 use tikv_util::collections::{HashMap, HashSet};
 use tikv_util::time::{duration_to_sec, monotonic_raw_now};
 use tikv_util::time::{Instant as UtilInstant, ThreadReadId};
+use tikv_util::trace::*;
 use tikv_util::worker::{FutureScheduler, Scheduler};
 use tikv_util::Either;
 
@@ -1904,6 +1905,7 @@ where
         }
     }
 
+    #[trace("Peer::post_apply")]
     pub fn post_apply<T>(
         &mut self,
         ctx: &mut PollContext<EK, ER, T>,
@@ -2053,6 +2055,7 @@ where
         mut cb: Callback<EK::Snapshot>,
         req: RaftCmdRequest,
         mut err_resp: RaftCmdResponse,
+        trace_scopes: Vec<Scope>,
     ) -> bool {
         if self.pending_remove {
             return false;
@@ -2073,7 +2076,9 @@ where
                 self.read_local(ctx, req, cb);
                 return false;
             }
-            Ok(RequestPolicy::ReadIndex) => return self.read_index(ctx, req, err_resp, cb),
+            Ok(RequestPolicy::ReadIndex) => {
+                return self.read_index(ctx, req, err_resp, cb, trace_scopes)
+            }
             Ok(RequestPolicy::ProposeNormal) => self.propose_normal(ctx, req),
             Ok(RequestPolicy::ProposeTransferLeader) => {
                 return self.propose_transfer_leader(ctx, req, cb);
@@ -2116,6 +2121,7 @@ where
                     cb,
                     renew_lease_time: None,
                     must_pass_epoch_check: has_applied_to_current_term,
+                    trace_scopes,
                 };
                 if let Some(cmd_type) = req_admin_cmd_type {
                     self.cmd_epoch_checker
@@ -2423,6 +2429,7 @@ where
         mut req: RaftCmdRequest,
         mut err_resp: RaftCmdResponse,
         cb: Callback<EK::Snapshot>,
+        trace_scopes: Vec<Scope>,
     ) -> bool {
         if let Err(e) = self.pre_read_index() {
             debug!(
@@ -2552,6 +2559,7 @@ where
                     cb: Callback::None,
                     renew_lease_time: Some(renew_lease_time),
                     must_pass_epoch_check: false,
+                    trace_scopes,
                 };
                 self.post_propose(poll_ctx, p);
             }
@@ -3802,6 +3810,7 @@ mod tests {
                 cb: Callback::None,
                 renew_lease_time,
                 must_pass_epoch_check: false,
+                trace_scopes: vec![],
             });
         }
         for remove_i in &[0, 65, 98] {

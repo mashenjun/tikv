@@ -28,6 +28,7 @@ use engine_traits::{KvEngine, RaftEngine};
 use tikv_util::collections::HashMap;
 use tikv_util::time::monotonic_raw_now;
 use tikv_util::time::{Instant, ThreadReadId};
+use tikv_util::trace::*;
 
 use super::metrics::*;
 use crate::store::fsm::store::StoreMeta;
@@ -421,6 +422,7 @@ where
         }
     }
 
+    #[trace("LocalReader::propose_raft_command")]
     pub fn propose_raft_command(
         &mut self,
         mut read_id: Option<ThreadReadId>,

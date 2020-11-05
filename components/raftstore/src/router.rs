@@ -10,6 +10,7 @@ use raft::SnapshotStatus;
 use tikv_util::time::ThreadReadId;
 
 use crate::store::fsm::RaftRouter;
+use crate::store::msg::TracedMsg;
 use crate::store::transport::{CasualRouter, ProposalRouter, StoreRouter};
 use crate::store::{
     Callback, CasualMessage, LocalReader, PeerMsg, RaftCommand, SignificantMsg, StoreMsg,
@@ -252,10 +253,10 @@ impl<EK: KvEngine, ER: RaftEngine> RaftStoreRouter<EK> for RaftRouter<EK, ER> {
         region_id: u64,
         msg: SignificantMsg<EK::Snapshot>,
     ) -> RaftStoreResult<()> {
-        if let Err(SendError(msg)) = self
-            .router
-            .force_send(region_id, PeerMsg::SignificantMsg(msg))
-        {
+        if let Err(SendError(msg)) = self.router.force_send(
+            region_id,
+            TracedMsg::new(PeerMsg::SignificantMsg(msg), "PeerMsg::SignificantMsg"),
+        ) {
             // TODO: panic here once we can detect system is shutting down reliably.
             error!("failed to send significant msg"; "msg" => ?msg);
             return Err(RaftStoreError::RegionNotFound(region_id));
@@ -264,7 +265,9 @@ impl<EK: KvEngine, ER: RaftEngine> RaftStoreRouter<EK> for RaftRouter<EK, ER> {
         Ok(())
     }
 
-    fn broadcast_normal(&self, msg_gen: impl FnMut() -> PeerMsg<EK>) {
-        batch_system::Router::broadcast_normal(self, msg_gen)
+    fn broadcast_normal(&self, mut msg_gen: impl FnMut() -> PeerMsg<EK>) {
+        batch_system::Router::broadcast_normal(self, move || {
+            TracedMsg::new(msg_gen(), "broadcast PeerMsg")
+        })
     }
 }

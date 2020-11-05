@@ -34,6 +34,7 @@ use crate::store::Callback;
 use crate::store::StoreInfo;
 use crate::store::{CasualMessage, PeerMsg, RaftCommand, RaftRouter, StoreMsg};
 
+use crate::store::msg::TracedMsg;
 use concurrency_manager::ConcurrencyManager;
 use pd_client::metrics::*;
 use pd_client::{Error, PdClient, RegionStat};
@@ -720,7 +721,10 @@ where
             match resp.await {
                 Ok(mut resp) => {
                     if let Some(status) = resp.replication_status.take() {
-                        let _ = router.send_control(StoreMsg::UpdateReplicationMode(status));
+                        let _ = router.send_control(TracedMsg::new(
+                            StoreMsg::UpdateReplicationMode(status),
+                            "StoreMsg::UpdateReplicationMode",
+                        ));
                     }
                 }
                 Err(e) => {
@@ -884,7 +888,7 @@ where
                             source: "pd",
                         }
                     };
-                    if let Err(e) = router.send(region_id, PeerMsg::CasualMessage(msg)) {
+                    if let Err(e) = router.send(region_id, TracedMsg::new(PeerMsg::CasualMessage(msg), "PeerMsg::CasualMessage")) {
                         error!("send halfsplit request failed"; "region_id" => region_id, "err" => ?e);
                     }
                 } else if resp.has_merge() {
@@ -1002,7 +1006,10 @@ where
             match resp.await {
                 Ok(Some((region, leader))) => {
                     let msg = CasualMessage::QueryRegionLeaderResp { region, leader };
-                    if let Err(e) = router.send(region_id, PeerMsg::CasualMessage(msg)) {
+                    if let Err(e) = router.send(
+                        region_id,
+                        TracedMsg::new(PeerMsg::CasualMessage(msg), "PeerMsg::CasualMessage"),
+                    ) {
                         error!("send region info message failed"; "region_id" => region_id, "err" => ?e);
                     }
                 }

@@ -33,18 +33,19 @@ use raft::{Ready, StateRole};
 use tikv_util::collections::HashMap;
 use tikv_util::mpsc::{self, LooseBoundedSender, Receiver};
 use tikv_util::time::duration_to_sec;
+use tikv_util::trace::*;
 use tikv_util::worker::{Scheduler, Stopped};
 use tikv_util::{escape, is_zero_duration, Either};
 
 use crate::coprocessor::RegionChangeEvent;
 use crate::store::cmd_resp::{bind_term, new_error};
-use crate::store::fsm::store::{PollContext, StoreMeta};
+use crate::store::fsm::store::{PollContext, StoreMeta, TRACE_GUARD};
 use crate::store::fsm::{
     apply, ApplyMetrics, ApplyTask, ApplyTaskRes, CatchUpLogs, ChangeCmd, ChangePeer, ExecResult,
 };
 use crate::store::local_metrics::RaftProposeMetrics;
 use crate::store::metrics::*;
-use crate::store::msg::{Callback, ExtCallback};
+use crate::store::msg::{Callback, ExtCallback, TracedMsg};
 use crate::store::peer::{ConsistencyState, Peer, StaleState};
 use crate::store::peer_storage::{ApplySnapResult, InvokeContext};
 use crate::store::transport::Transport;
@@ -105,7 +106,7 @@ where
     has_ready: bool,
     early_apply: bool,
     mailbox: Option<BasicMailbox<PeerFsm<EK, ER>>>,
-    pub receiver: Receiver<PeerMsg<EK>>,
+    pub receiver: Receiver<TracedMsg<PeerMsg<EK>>>,
     /// when snapshot is generating or sending, skip split check at most REGION_SPLIT_SKIT_MAX_COUNT times.
     skip_split_count: usize,
     /// Sometimes applied raft logs won't be compacted in time, because less compact means less
@@ -125,6 +126,7 @@ where
     batch_req_size: u32,
     request: Option<RaftCmdRequest>,
     callbacks: Vec<(Callback<E::Snapshot>, usize)>,
+    trace_scopes: Vec<Scope>,
 }
 
 impl<EK, ER> Drop for PeerFsm<EK, ER>
@@ -135,7 +137,7 @@ where
     fn drop(&mut self) {
         self.peer.stop();
         while let Ok(msg) = self.receiver.try_recv() {
-            let callback = match msg {
+            let callback = match msg.msg {
                 PeerMsg::RaftCommand(cmd) => cmd.callback,
                 PeerMsg::CasualMessage(CasualMessage::SplitRegion { callback, .. }) => callback,
                 _ => continue,
@@ -151,7 +153,10 @@ where
     }
 }
 
-pub type SenderFsmPair<EK, ER> = (LooseBoundedSender<PeerMsg<EK>>, Box<PeerFsm<EK, ER>>);
+pub type SenderFsmPair<EK, ER> = (
+    LooseBoundedSender<TracedMsg<PeerMsg<EK>>>,
+    Box<PeerFsm<EK, ER>>,
+);
 
 impl<EK, ER> PeerFsm<EK, ER>
 where
@@ -288,6 +293,7 @@ where
             request: None,
             batch_req_size: 0,
             callbacks: vec![],
+            trace_scopes: vec![],
         }
     }
 
@@ -315,7 +321,7 @@ where
         true
     }
 
-    fn add(&mut self, cmd: RaftCommand<E::Snapshot>, req_size: u32) {
+    fn add(&mut self, cmd: RaftCommand<E::Snapshot>, req_size: u32, trace_scope: Scope) {
         let req_num = cmd.request.get_requests().len();
         let RaftCommand {
             mut request,
@@ -332,6 +338,7 @@ where
         };
         self.callbacks.push((callback, req_num));
         self.batch_req_size += req_size;
+        self.trace_scopes.push(trace_scope);
     }
 
     fn should_finish(&self) -> bool {
@@ -348,12 +355,18 @@ where
         false
     }
 
-    fn build(&mut self, metric: &mut RaftProposeMetrics) -> Option<RaftCommand<E::Snapshot>> {
+    fn build(
+        &mut self,
+        metric: &mut RaftProposeMetrics,
+    ) -> Option<(RaftCommand<E::Snapshot>, Vec<Scope>)> {
         if let Some(req) = self.request.take() {
             self.batch_req_size = 0;
             if self.callbacks.len() == 1 {
                 let (cb, _) = self.callbacks.pop().unwrap();
-                return Some(RaftCommand::new(req, cb));
+                return Some((
+                    RaftCommand::new(req, cb),
+                    std::mem::take(&mut self.trace_scopes),
+                ));
             }
             metric.batch += self.callbacks.len() - 1;
             let mut cbs = std::mem::take(&mut self.callbacks);
@@ -415,7 +428,10 @@ where
                 proposed_cb,
                 committed_cb,
             );
-            return Some(RaftCommand::new(req, cb));
+            return Some((
+                RaftCommand::new(req, cb),
+                std::mem::take(&mut self.trace_scopes),
+            ));
         }
         None
     }
@@ -426,7 +442,7 @@ where
     EK: KvEngine,
     ER: RaftEngine,
 {
-    type Message = PeerMsg<EK>;
+    type Message = TracedMsg<PeerMsg<EK>>;
 
     #[inline]
     fn is_stopped(&self) -> bool {
@@ -474,8 +490,14 @@ where
         PeerFsmDelegate { fsm, ctx }
     }
 
-    pub fn handle_msgs(&mut self, msgs: &mut Vec<PeerMsg<EK>>) {
-        for m in msgs.drain(..) {
+    pub fn handle_msgs(&mut self, msgs: &mut Vec<TracedMsg<PeerMsg<EK>>>) {
+        TRACE_GUARD.with(|g| g.set(Some(start_scopes(msgs.iter().map(|m| &m.trace_scope)))));
+
+        for TracedMsg {
+            trace_scope,
+            msg: m,
+        } in msgs.drain(..)
+        {
             match m {
                 PeerMsg::RaftMessage(msg) => {
                     if let Err(e) = self.on_raft_message(msg) {
@@ -494,13 +516,19 @@ where
                         .observe(duration_to_sec(cmd.send_time.elapsed()) as f64);
                     let req_size = cmd.request.compute_size();
                     if self.fsm.batch_req_builder.can_batch(&cmd.request, req_size) {
-                        self.fsm.batch_req_builder.add(cmd, req_size);
+                        self.fsm
+                            .batch_req_builder
+                            .add(cmd, req_size, trace_scope.clone());
                         if self.fsm.batch_req_builder.should_finish() {
                             self.propose_batch_raft_command();
                         }
                     } else {
                         self.propose_batch_raft_command();
-                        self.propose_raft_command(cmd.request, cmd.callback)
+                        self.propose_raft_command(
+                            cmd.request,
+                            cmd.callback,
+                            vec![trace_scope.clone()],
+                        )
                     }
                 }
                 PeerMsg::Tick(tick) => self.on_tick(tick),
@@ -524,12 +552,12 @@ where
     }
 
     fn propose_batch_raft_command(&mut self) {
-        if let Some(cmd) = self
+        if let Some((cmd, trace_scopes)) = self
             .fsm
             .batch_req_builder
             .build(&mut self.ctx.raft_metrics.propose)
         {
-            self.propose_raft_command(cmd.request, cmd.callback)
+            self.propose_raft_command(cmd.request, cmd.callback, trace_scopes)
         }
     }
 
@@ -779,6 +807,7 @@ where
                     },
                 )
             })),
+            vec![],
         );
     }
 
@@ -876,7 +905,7 @@ where
             self.region().get_region_epoch().clone(),
             self.fsm.peer.peer.clone(),
         );
-        self.propose_raft_command(msg, cb);
+        self.propose_raft_command(msg, cb, vec![]);
     }
 
     fn on_role_changed(&mut self, ready: &Ready) {
@@ -914,6 +943,7 @@ where
     }
 
     #[inline]
+    #[trace("PeerFsmDelegate::handle_raft_ready_apply")]
     pub fn handle_raft_ready_apply(&mut self, ready: &mut Ready, invoke_ctx: &InvokeContext) {
         self.fsm.early_apply = ready
             .committed_entries
@@ -930,6 +960,7 @@ where
             .handle_raft_ready_apply(self.ctx, ready, invoke_ctx);
     }
 
+    #[trace("PeerFsmDelegate::post_raft_ready_append")]
     pub fn post_raft_ready_append(&mut self, mut ready: Ready, invoke_ctx: InvokeContext) {
         let is_merging = self.fsm.peer.pending_merge_state.is_some();
         if !self.fsm.early_apply {
@@ -1011,7 +1042,7 @@ where
             // This can happen only when the peer is about to be destroyed
             // or the node is shutting down. So it's OK to not to clean up
             // registry.
-            if let Err(e) = mb.force_send(PeerMsg::Tick(tick)) {
+            if let Err(e) = mb.force_send(TracedMsg::new(PeerMsg::Tick(tick), "PeerMsg::Tick")) {
                 debug!(
                     "failed to schedule peer tick";
                     "region_id" => region_id,
@@ -1114,6 +1145,7 @@ where
         fail_point!("on_apply_res", |_| {});
         match res {
             ApplyTaskRes::Apply(mut res) => {
+                let _g = start_span("ApplyTaskRes::Apply");
                 debug!(
                     "async apply finish";
                     "region_id" => self.region_id(),
@@ -1139,6 +1171,7 @@ where
                 peer_id,
                 merge_from_snapshot,
             } => {
+                let _g = start_span("ApplyTaskRes::Destroy");
                 assert_eq!(peer_id, self.fsm.peer.peer_id());
                 if !merge_from_snapshot {
                     self.destroy_peer(false);
@@ -1400,11 +1433,10 @@ where
                             "target_peer" => ?target,
                         );
                         if self.handle_destroy_peer(job) {
-                            if let Err(e) = self
-                                .ctx
-                                .router
-                                .send_control(StoreMsg::RaftMessage(msg.clone()))
-                            {
+                            if let Err(e) = self.ctx.router.send_control(TracedMsg::new(
+                                StoreMsg::RaftMessage(msg.clone()),
+                                "StoreMsg::RaftMessage",
+                            )) {
                                 info!(
                                     "failed to send back store message, are we shutting down?";
                                     "region_id" => self.fsm.region_id(),
@@ -1678,7 +1710,10 @@ where
                 // may has been merged/splitted already.
                 let _ = self.ctx.router.force_send(
                     exist_region.get_id(),
-                    PeerMsg::CasualMessage(CasualMessage::RegionOverlapped),
+                    TracedMsg::new(
+                        PeerMsg::CasualMessage(CasualMessage::RegionOverlapped),
+                        "PeerMsg::CasualMessage::RegionOverlapped",
+                    ),
                 );
             }
         }
@@ -1757,11 +1792,14 @@ where
                 .router
                 .force_send(
                     source_region_id,
-                    PeerMsg::SignificantMsg(SignificantMsg::MergeResult {
-                        target_region_id: self.fsm.region_id(),
-                        target: self.fsm.peer.peer.clone(),
-                        result,
-                    }),
+                    TracedMsg::new(
+                        PeerMsg::SignificantMsg(SignificantMsg::MergeResult {
+                            target_region_id: self.fsm.region_id(),
+                            target: self.fsm.peer.peer.clone(),
+                            result,
+                        }),
+                        "PeerMsg::SignificantMsg::MergeResult",
+                    ),
                 )
                 .unwrap();
         }
@@ -1941,6 +1979,7 @@ where
         }
     }
 
+    #[trace("PeerFsmDelegate::on_ready_change_peer")]
     fn on_ready_change_peer(&mut self, cp: ChangePeer) {
         if cp.index == raft::INVALID_INDEX {
             // Apply failed, skip.
@@ -2063,6 +2102,7 @@ where
         }
     }
 
+    #[trace("PeerFsmDelegate::on_ready_compact_log")]
     fn on_ready_compact_log(&mut self, first_index: u64, state: RaftTruncatedState) {
         let total_cnt = self.fsm.peer.last_applying_idx - first_index;
         // the size of current CompactLog command can be ignored.
@@ -2087,6 +2127,7 @@ where
         }
     }
 
+    #[trace("PeerFsmDelegate::on_ready_split_region")]
     fn on_ready_split_region(
         &mut self,
         derived: metapb::Region,
@@ -2265,7 +2306,10 @@ where
             self.ctx.router.register(new_region_id, mailbox);
             self.ctx
                 .router
-                .force_send(new_region_id, PeerMsg::Start)
+                .force_send(
+                    new_region_id,
+                    TracedMsg::new(PeerMsg::Start, "PeerMsg::Start"),
+                )
                 .unwrap();
 
             if !campaigned {
@@ -2273,11 +2317,10 @@ where
                     .pending_msgs
                     .swap_remove_front(|m| m.get_to_peer() == &meta_peer)
                 {
-                    if let Err(e) = self
-                        .ctx
-                        .router
-                        .force_send(new_region_id, PeerMsg::RaftMessage(msg))
-                    {
+                    if let Err(e) = self.ctx.router.force_send(
+                        new_region_id,
+                        TracedMsg::new(PeerMsg::RaftMessage(msg), "PeerMsg::RaftMessage"),
+                    ) {
                         warn!("handle first requset failed"; "region_id" => region_id, "error" => ?e);
                     }
                 }
@@ -2505,7 +2548,10 @@ where
             .router
             .force_send(
                 target_id,
-                PeerMsg::RaftCommand(RaftCommand::new(request, Callback::None)),
+                TracedMsg::new(
+                    PeerMsg::RaftCommand(RaftCommand::new(request, Callback::None)),
+                    "PeerMsg::RaftCommand",
+                ),
             )
             .map_err(|_| Error::RegionNotFound(target_id))
     }
@@ -2524,7 +2570,7 @@ where
             request.set_admin_request(admin);
             request
         };
-        self.propose_raft_command(req, Callback::None);
+        self.propose_raft_command(req, Callback::None, vec![]);
     }
 
     fn on_check_merge(&mut self) {
@@ -2723,11 +2769,14 @@ where
         }
         if let Err(e) = self.ctx.router.force_send(
             source.get_id(),
-            PeerMsg::SignificantMsg(SignificantMsg::MergeResult {
-                target_region_id: self.fsm.region_id(),
-                target: self.fsm.peer.peer.clone(),
-                result: MergeResultKind::FromTargetLog,
-            }),
+            TracedMsg::new(
+                PeerMsg::SignificantMsg(SignificantMsg::MergeResult {
+                    target_region_id: self.fsm.region_id(),
+                    target: self.fsm.peer.peer.clone(),
+                    result: MergeResultKind::FromTargetLog,
+                }),
+                "PeerMsg::SignificantMsg::MergeResult",
+            ),
         ) {
             if !self.ctx.router.is_shutdown() {
                 panic!(
@@ -2970,11 +3019,14 @@ where
         for r in &apply_result.destroyed_regions {
             if let Err(e) = self.ctx.router.force_send(
                 r.get_id(),
-                PeerMsg::SignificantMsg(SignificantMsg::MergeResult {
-                    target_region_id: self.fsm.region_id(),
-                    target: self.fsm.peer.peer.clone(),
-                    result: MergeResultKind::FromTargetSnapshotStep2,
-                }),
+                TracedMsg::new(
+                    PeerMsg::SignificantMsg(SignificantMsg::MergeResult {
+                        target_region_id: self.fsm.region_id(),
+                        target: self.fsm.peer.peer.clone(),
+                        result: MergeResultKind::FromTargetSnapshotStep2,
+                    }),
+                    "PeerMsg::SignificantMsg::MergeResult",
+                ),
             ) {
                 if !self.ctx.router.is_shutdown() {
                     panic!("{} failed to send merge result(FromTargetSnapshotStep2) to source region {}, err {}", self.fsm.peer.tag, r.get_id(), e);
@@ -2983,6 +3035,7 @@ where
         }
     }
 
+    #[trace("PeerFsmDelegate::on_ready_result")]
     fn on_ready_result(
         &mut self,
         exec_results: &mut VecDeque<ExecResult<EK::Snapshot>>,
@@ -3100,6 +3153,7 @@ where
         Ok(())
     }
 
+    #[trace("PeerFsmDelegate::pre_propose_raft_command")]
     fn pre_propose_raft_command(
         &mut self,
         msg: &RaftCmdRequest,
@@ -3185,7 +3239,13 @@ where
         }
     }
 
-    fn propose_raft_command(&mut self, mut msg: RaftCmdRequest, cb: Callback<EK::Snapshot>) {
+    #[trace("PeerFsmDelegate::propose_raft_command")]
+    fn propose_raft_command(
+        &mut self,
+        mut msg: RaftCmdRequest,
+        cb: Callback<EK::Snapshot>,
+        trace_scopes: Vec<Scope>,
+    ) {
         match self.pre_propose_raft_command(&msg) {
             Ok(Some(resp)) => {
                 cb.invoke_with_response(resp);
@@ -3231,7 +3291,7 @@ where
         let mut resp = RaftCmdResponse::default();
         let term = self.fsm.peer.term();
         bind_term(&mut resp, term);
-        if self.fsm.peer.propose(self.ctx, cb, msg, resp) {
+        if self.fsm.peer.propose(self.ctx, cb, msg, resp, trace_scopes) {
             self.fsm.has_ready = true;
         }
 
@@ -3371,7 +3431,7 @@ where
         let peer = self.fsm.peer.peer.clone();
         let term = self.fsm.peer.get_index_term(compact_idx);
         let request = new_compact_log_request(region_id, peer, compact_idx, term);
-        self.propose_raft_command(request, Callback::None);
+        self.propose_raft_command(request, Callback::None, vec![]);
 
         self.fsm.skip_gc_raft_log_ticks = 0;
         self.register_raft_gc_log_tick();
@@ -3784,7 +3844,7 @@ where
             self.fsm.peer.peer.clone(),
             &self.fsm.peer.consistency_state,
         );
-        self.propose_raft_command(req, Callback::None);
+        self.propose_raft_command(req, Callback::None, vec![]);
     }
 
     fn on_ingest_sst_result(&mut self, ssts: Vec<SstMeta>) {
@@ -4045,6 +4105,7 @@ mod tests {
     use protobuf::Message;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use tikv_util::trace::Scope;
 
     #[test]
     fn test_batch_raft_cmd_request_builder() {
@@ -4137,9 +4198,9 @@ mod tests {
             );
             response.mut_responses().push(Response::default());
             let cmd = RaftCommand::new(req.clone(), cb);
-            builder.add(cmd, 100);
+            builder.add(cmd, 100, Scope::empty());
         }
-        let mut cmd = builder.build(&mut metric).unwrap();
+        let (mut cmd, _) = builder.build(&mut metric).unwrap();
         cmd.callback.invoke_proposed();
         for flag in proposed_cbs_flags {
             assert!(flag.load(Ordering::Acquire));

@@ -33,6 +33,7 @@ use super::snap::{Runner as SnapHandler, Task as SnapTask};
 use super::transport::ServerTransport;
 use super::{Config, Result};
 use crate::read_pool::ReadPool;
+use crate::server::trace::Reporter as TraceReporter;
 
 const LOAD_STATISTICS_SLOTS: usize = 4;
 const LOAD_STATISTICS_INTERVAL: Duration = Duration::from_millis(100);
@@ -81,6 +82,7 @@ impl<T: RaftStoreRouter<RocksEngine> + Unpin, S: StoreAddrResolver + 'static> Se
         env: Arc<Environment>,
         yatp_read_pool: Option<ReadPool>,
         debug_thread_pool: Arc<Runtime>,
+        trace_reporter: Arc<TraceReporter>,
     ) -> Result<Self> {
         // A helper thread (or pool) for transport layer.
         let stats_pool = if cfg.stats_concurrency > 0 {
@@ -112,6 +114,7 @@ impl<T: RaftStoreRouter<RocksEngine> + Unpin, S: StoreAddrResolver + 'static> Se
             Arc::clone(&readpool_normal_thread_load),
             cfg.enable_request_batch,
             security_mgr.clone(),
+            trace_reporter,
         );
 
         let addr = SocketAddr::from_str(&cfg.addr)?;
@@ -354,6 +357,7 @@ mod tests {
     use super::super::{Config, Result};
     use crate::config::CoprReadPoolConfig;
     use crate::coprocessor::{self, readpool_impl};
+    use crate::server::trace::ReporterBuilder as TraceReporterBuilder;
     use crate::server::TestRaftStoreRouter;
     use crate::storage::TestStorageBuilder;
     use grpcio::EnvBuilder;
@@ -468,6 +472,7 @@ mod tests {
             env,
             None,
             debug_thread_pool,
+            Arc::new(TraceReporterBuilder::new().build()),
         )
         .unwrap();
 

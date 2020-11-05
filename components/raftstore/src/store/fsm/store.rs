@@ -1,5 +1,6 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
+use std::cell::Cell;
 use std::cmp::{Ord, Ordering as CmpOrdering};
 use std::collections::BTreeMap;
 use std::collections::Bound::{Excluded, Included, Unbounded};
@@ -36,6 +37,7 @@ use tikv_util::config::{Tracker, VersionTrack};
 use tikv_util::mpsc::{self, LooseBoundedSender, Receiver};
 use tikv_util::time::{duration_to_sec, Instant as TiInstant};
 use tikv_util::timer::SteadyTimer;
+use tikv_util::trace::*;
 use tikv_util::worker::{FutureScheduler, FutureWorker, Scheduler, Worker};
 use tikv_util::{is_zero_duration, sys as sys_util, Either, RingQueue};
 
@@ -55,6 +57,7 @@ use crate::store::fsm::{
 };
 use crate::store::local_metrics::RaftMetrics;
 use crate::store::metrics::*;
+use crate::store::msg::TracedMsg;
 use crate::store::peer_storage::{self, HandleRaftReadyContext, InvokeContext};
 use crate::store::transport::Transport;
 use crate::store::util::{is_initial_msg, PerfContextStatistics};
@@ -190,14 +193,18 @@ where
         for r in apply_res {
             self.router.try_send(
                 r.region_id,
-                PeerMsg::ApplyRes {
-                    res: ApplyTaskRes::Apply(r),
-                },
+                TracedMsg::new(
+                    PeerMsg::ApplyRes {
+                        res: ApplyTaskRes::Apply(r),
+                    },
+                    "PeerMsg::ApplyRes",
+                ),
             );
         }
     }
     fn notify_one(&self, region_id: u64, msg: PeerMsg<EK>) {
-        self.router.try_send(region_id, msg);
+        self.router
+            .try_send(region_id, TracedMsg::new(msg, "notify_one PeerMsg"));
     }
 
     fn clone_box(&self) -> Box<dyn ApplyNotifier<EK>> {
@@ -215,23 +222,42 @@ where
         mut msg: RaftMessage,
     ) -> std::result::Result<(), TrySendError<RaftMessage>> {
         let id = msg.get_region_id();
-        match self.try_send(id, PeerMsg::RaftMessage(msg)) {
+        match self.try_send(
+            id,
+            TracedMsg::new(PeerMsg::RaftMessage(msg), "PeerMsg::RaftMessage"),
+        ) {
             Either::Left(Ok(())) => return Ok(()),
-            Either::Left(Err(TrySendError::Full(PeerMsg::RaftMessage(m)))) => {
+            Either::Left(Err(TrySendError::Full(TracedMsg {
+                msg: PeerMsg::RaftMessage(m),
+                ..
+            }))) => {
                 return Err(TrySendError::Full(m));
             }
-            Either::Left(Err(TrySendError::Disconnected(PeerMsg::RaftMessage(m)))) => {
+            Either::Left(Err(TrySendError::Disconnected(TracedMsg {
+                msg: PeerMsg::RaftMessage(m),
+                ..
+            }))) => {
                 return Err(TrySendError::Disconnected(m));
             }
-            Either::Right(PeerMsg::RaftMessage(m)) => msg = m,
+            Either::Right(TracedMsg {
+                msg: PeerMsg::RaftMessage(m),
+                ..
+            }) => msg = m,
             _ => unreachable!(),
         }
-        match self.send_control(StoreMsg::RaftMessage(msg)) {
+        match self.send_control(TracedMsg::new(
+            StoreMsg::RaftMessage(msg),
+            "StoreMsg::RaftMessage",
+        )) {
             Ok(()) => Ok(()),
-            Err(TrySendError::Full(StoreMsg::RaftMessage(m))) => Err(TrySendError::Full(m)),
-            Err(TrySendError::Disconnected(StoreMsg::RaftMessage(m))) => {
-                Err(TrySendError::Disconnected(m))
-            }
+            Err(TrySendError::Full(TracedMsg {
+                msg: StoreMsg::RaftMessage(m),
+                ..
+            })) => Err(TrySendError::Full(m)),
+            Err(TrySendError::Disconnected(TracedMsg {
+                msg: StoreMsg::RaftMessage(m),
+                ..
+            })) => Err(TrySendError::Disconnected(m)),
             _ => unreachable!(),
         }
     }
@@ -242,30 +268,48 @@ where
         cmd: RaftCommand<EK::Snapshot>,
     ) -> std::result::Result<(), TrySendError<RaftCommand<EK::Snapshot>>> {
         let region_id = cmd.request.get_header().get_region_id();
-        match self.send(region_id, PeerMsg::RaftCommand(cmd)) {
+        match self.send(
+            region_id,
+            TracedMsg::new(PeerMsg::RaftCommand(cmd), "PeerMsg::RaftCommand"),
+        ) {
             Ok(()) => Ok(()),
-            Err(TrySendError::Full(PeerMsg::RaftCommand(cmd))) => Err(TrySendError::Full(cmd)),
-            Err(TrySendError::Disconnected(PeerMsg::RaftCommand(cmd))) => {
-                Err(TrySendError::Disconnected(cmd))
-            }
+            Err(TrySendError::Full(TracedMsg {
+                msg: PeerMsg::RaftCommand(cmd),
+                ..
+            })) => Err(TrySendError::Full(cmd)),
+            Err(TrySendError::Disconnected(TracedMsg {
+                msg: PeerMsg::RaftCommand(cmd),
+                ..
+            })) => Err(TrySendError::Disconnected(cmd)),
             _ => unreachable!(),
         }
     }
 
     fn report_unreachable(&self, store_id: u64) {
         self.broadcast_normal(|| {
-            PeerMsg::SignificantMsg(SignificantMsg::StoreUnreachable { store_id })
+            TracedMsg::new(
+                PeerMsg::SignificantMsg(SignificantMsg::StoreUnreachable { store_id }),
+                "PeerMsg::SignificantMsg::StoreUnreachable",
+            )
         });
     }
 
     fn report_status_update(&self) {
-        self.broadcast_normal(|| PeerMsg::UpdateReplicationMode)
+        self.broadcast_normal(|| {
+            TracedMsg::new(
+                PeerMsg::UpdateReplicationMode,
+                "PeerMsg::UpdateReplicationMode",
+            )
+        })
     }
 
     /// Broadcasts resolved result to all regions.
     pub fn report_resolved(&self, store_id: u64, group_id: u64) {
         self.broadcast_normal(|| {
-            PeerMsg::SignificantMsg(SignificantMsg::StoreResolved { store_id, group_id })
+            TracedMsg::new(
+                PeerMsg::SignificantMsg(SignificantMsg::StoreResolved { store_id, group_id }),
+                "PeerMsg::StoreResolved ",
+            )
         })
     }
 }
@@ -416,7 +460,9 @@ where
         if !is_zero_duration(&timeout) {
             let mb = self.router.control_mailbox();
             let delay = self.timer.delay(timeout).compat().map(move |_| {
-                if let Err(e) = mb.force_send(StoreMsg::Tick(tick)) {
+                if let Err(e) =
+                    mb.force_send(TracedMsg::new(StoreMsg::Tick(tick), "StoreMsg::Tick"))
+                {
                     info!(
                         "failed to schedule store tick, are we shutting down?";
                         "tick" => ?tick,
@@ -493,14 +539,19 @@ where
     EK: KvEngine,
 {
     store: Store,
-    receiver: Receiver<StoreMsg<EK>>,
+    receiver: Receiver<TracedMsg<StoreMsg<EK>>>,
 }
 
 impl<EK> StoreFsm<EK>
 where
     EK: KvEngine,
 {
-    pub fn new(cfg: &Config) -> (LooseBoundedSender<StoreMsg<EK>>, Box<StoreFsm<EK>>) {
+    pub fn new(
+        cfg: &Config,
+    ) -> (
+        LooseBoundedSender<TracedMsg<StoreMsg<EK>>>,
+        Box<StoreFsm<EK>>,
+    ) {
         let (tx, rx) = mpsc::loose_bounded(cfg.notify_capacity);
         let fsm = Box::new(StoreFsm {
             store: Store {
@@ -521,7 +572,7 @@ impl<EK> Fsm for StoreFsm<EK>
 where
     EK: KvEngine,
 {
-    type Message = StoreMsg<EK>;
+    type Message = TracedMsg<StoreMsg<EK>>;
 
     #[inline]
     fn is_stopped(&self) -> bool {
@@ -560,8 +611,10 @@ impl<'a, EK: KvEngine + 'static, ER: RaftEngine + 'static, T: Transport>
         );
     }
 
-    fn handle_msgs(&mut self, msgs: &mut Vec<StoreMsg<EK>>) {
-        for m in msgs.drain(..) {
+    fn handle_msgs(&mut self, msgs: &mut Vec<TracedMsg<StoreMsg<EK>>>) {
+        TRACE_GUARD.with(|g| g.set(Some(start_scopes(msgs.iter().map(|m| &m.trace_scope)))));
+
+        for TracedMsg { msg: m, .. } in msgs.drain(..) {
             match m {
                 StoreMsg::Tick(tick) => self.on_tick(tick),
                 StoreMsg::RaftMessage(msg) => {
@@ -611,8 +664,8 @@ impl<'a, EK: KvEngine + 'static, ER: RaftEngine + 'static, T: Transport>
 
 pub struct RaftPoller<EK: KvEngine + 'static, ER: RaftEngine + 'static, T: 'static> {
     tag: String,
-    store_msg_buf: Vec<StoreMsg<EK>>,
-    peer_msg_buf: Vec<PeerMsg<EK>>,
+    store_msg_buf: Vec<TracedMsg<StoreMsg<EK>>>,
+    peer_msg_buf: Vec<TracedMsg<PeerMsg<EK>>>,
     previous_metrics: RaftMetrics,
     timer: TiInstant,
     poll_ctx: PollContext<EK, ER, T>,
@@ -620,7 +673,12 @@ pub struct RaftPoller<EK: KvEngine + 'static, ER: RaftEngine + 'static, T: 'stat
     cfg_tracker: Tracker<Config>,
 }
 
+thread_local! {
+    pub(super) static TRACE_GUARD: Cell<Option<LocalScopeGuard>> = Cell::new(None);
+}
+
 impl<EK: KvEngine, ER: RaftEngine, T: Transport> RaftPoller<EK, ER, T> {
+    #[trace("RaftPoller::handle_raft_ready")]
     fn handle_raft_ready(&mut self, peers: &mut [Box<PeerFsm<EK, ER>>]) {
         // Only enable the fail point when the store id is equal to 3, which is
         // the id of slow store in tests.
@@ -628,6 +686,8 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport> RaftPoller<EK, ER, T> {
         if self.poll_ctx.need_flush_trans
             && (!self.poll_ctx.kv_wb.is_empty() || !self.poll_ctx.raft_wb.is_empty())
         {
+            let _g = start_span("RaftPoller::trans.flush");
+
             self.poll_ctx.trans.flush();
             self.poll_ctx.need_flush_trans = false;
         }
@@ -635,6 +695,8 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport> RaftPoller<EK, ER, T> {
         self.poll_ctx.raft_metrics.ready.has_ready_region += ready_cnt as u64;
         fail_point!("raft_before_save");
         if !self.poll_ctx.kv_wb.is_empty() {
+            let _g = start_span("RaftPoller::engines.kv.write_opt");
+
             let mut write_opts = WriteOptions::new();
             write_opts.set_sync(true);
             self.poll_ctx
@@ -653,6 +715,8 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport> RaftPoller<EK, ER, T> {
         }
         fail_point!("raft_between_save");
         if !self.poll_ctx.raft_wb.is_empty() {
+            let _g = start_span("RaftPoller::engines.raft.consume_and_shrink");
+
             fail_point!(
                 "raft_before_save_on_store_1",
                 self.poll_ctx.store_id() == 1,
@@ -817,7 +881,7 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport> PollHandler<PeerFsm<EK, ER>, St
                     fail_point!(
                         "pause_on_peer_destroy_res",
                         peer.peer_id() == 1
-                            && matches!(msg, PeerMsg::ApplyRes {
+                            && matches!(msg.msg, PeerMsg::ApplyRes {
                                 res: ApplyTaskRes::Destroy { .. },
                             }),
                         |_| unreachable!()
@@ -853,6 +917,7 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport> PollHandler<PeerFsm<EK, ER>, St
             .observe(duration_to_sec(self.timer.elapsed()) as f64);
         self.poll_ctx.raft_metrics.flush();
         self.poll_ctx.store_stat.flush();
+        TRACE_GUARD.with(|guard| guard.set(None));
     }
 
     fn pause(&mut self) {
@@ -1288,7 +1353,7 @@ impl<EK: KvEngine, ER: RaftEngine> RaftBatchSystem<EK, ER> {
             router
                 .lock()
                 .unwrap()
-                .broadcast_normal(|| PeerMsg::HeartbeatPd);
+                .broadcast_normal(|| TracedMsg::new(PeerMsg::HeartbeatPd, "PeerMsg::HeartbeatPd"));
         });
 
         let tag = format!("raftstore-{}", store.get_id());
@@ -1303,12 +1368,17 @@ impl<EK: KvEngine, ER: RaftEngine> RaftBatchSystem<EK, ER> {
 
         // Make sure Msg::Start is the first message each FSM received.
         for addr in address {
-            self.router.force_send(addr, PeerMsg::Start).unwrap();
+            self.router
+                .force_send(addr, TracedMsg::new(PeerMsg::Start, "PeerMsg::Start"))
+                .unwrap();
         }
         self.router
-            .send_control(StoreMsg::Start {
-                store: store.clone(),
-            })
+            .send_control(TracedMsg::new(
+                StoreMsg::Start {
+                    store: store.clone(),
+                },
+                "StoreMsg::Start",
+            ))
             .unwrap();
 
         self.apply_system
@@ -1513,10 +1583,16 @@ impl<'a, EK: KvEngine, ER: RaftEngine, T: Transport> StoreFsmDelegate<'a, EK, ER
 
     fn on_raft_message(&mut self, mut msg: RaftMessage) -> Result<()> {
         let region_id = msg.get_region_id();
-        match self.ctx.router.send(region_id, PeerMsg::RaftMessage(msg)) {
+        match self.ctx.router.send(
+            region_id,
+            TracedMsg::new(PeerMsg::RaftMessage(msg), "PeerMsg::RaftMessage"),
+        ) {
             Ok(()) | Err(TrySendError::Full(_)) => return Ok(()),
             Err(TrySendError::Disconnected(_)) if self.ctx.router.is_shutdown() => return Ok(()),
-            Err(TrySendError::Disconnected(PeerMsg::RaftMessage(m))) => msg = m,
+            Err(TrySendError::Disconnected(TracedMsg {
+                msg: PeerMsg::RaftMessage(m),
+                ..
+            })) => msg = m,
             e => panic!(
                 "[store {}] [region {}] unexpected redirect error: {:?}",
                 self.fsm.store.id, region_id, e
@@ -1566,7 +1642,10 @@ impl<'a, EK: KvEngine, ER: RaftEngine, T: Transport> StoreFsmDelegate<'a, EK, ER
                     check_msg_status == CheckMsgStatus::NewPeerFirst,
                 )? {
                     // Peer created, send the message again
-                    let _ = self.ctx.router.send(region_id, PeerMsg::RaftMessage(msg));
+                    let _ = self.ctx.router.send(
+                        region_id,
+                        TracedMsg::new(PeerMsg::RaftMessage(msg), "PeerMsg::RaftMessage"),
+                    );
                     return Ok(());
                 }
                 // Can't create peer, see if we should keep this message
@@ -1586,11 +1665,10 @@ impl<'a, EK: KvEngine, ER: RaftEngine, T: Transport> StoreFsmDelegate<'a, EK, ER
                 store_meta.pending_msgs.push(msg);
             } else {
                 drop(store_meta);
-                if let Err(e) = self
-                    .ctx
-                    .router
-                    .force_send(region_id, PeerMsg::RaftMessage(msg))
-                {
+                if let Err(e) = self.ctx.router.force_send(
+                    region_id,
+                    TracedMsg::new(PeerMsg::RaftMessage(msg), "PeerMsg::RaftMessage"),
+                ) {
                     warn!("handle first request failed"; "region_id" => region_id, "error" => ?e);
                 }
             }
@@ -1725,7 +1803,10 @@ impl<'a, EK: KvEngine, ER: RaftEngine, T: Transport> StoreFsmDelegate<'a, EK, ER
                 // may has been merged/splitted already.
                 let _ = self.ctx.router.force_send(
                     exist_region.get_id(),
-                    PeerMsg::CasualMessage(CasualMessage::RegionOverlapped),
+                    TracedMsg::new(
+                        PeerMsg::CasualMessage(CasualMessage::RegionOverlapped),
+                        "PeerMsg::CasualMessage::RegionOverlapped",
+                    ),
                 );
             }
         }
@@ -1740,11 +1821,14 @@ impl<'a, EK: KvEngine, ER: RaftEngine, T: Transport> StoreFsmDelegate<'a, EK, ER
                 .router
                 .force_send(
                     id,
-                    PeerMsg::SignificantMsg(SignificantMsg::MergeResult {
-                        target_region_id: region_id,
-                        target: target.clone(),
-                        result: MergeResultKind::Stale,
-                    }),
+                    TracedMsg::new(
+                        PeerMsg::SignificantMsg(SignificantMsg::MergeResult {
+                            target_region_id: region_id,
+                            target: target.clone(),
+                            result: MergeResultKind::Stale,
+                        }),
+                        "PeerMsg::SignificantMsg::MergeResult",
+                    ),
                 )
                 .unwrap();
         }
@@ -1777,7 +1861,7 @@ impl<'a, EK: KvEngine, ER: RaftEngine, T: Transport> StoreFsmDelegate<'a, EK, ER
         self.ctx.router.register(region_id, mailbox);
         self.ctx
             .router
-            .force_send(region_id, PeerMsg::Start)
+            .force_send(region_id, TracedMsg::new(PeerMsg::Start, "PeerMsg::Start"))
             .unwrap();
         Ok(true)
     }
@@ -1808,9 +1892,12 @@ impl<'a, EK: KvEngine, ER: RaftEngine, T: Transport> StoreFsmDelegate<'a, EK, ER
         for (region_id, declined_bytes) in region_declined_bytes.drain(..) {
             let _ = self.ctx.router.send(
                 region_id,
-                PeerMsg::CasualMessage(CasualMessage::CompactionDeclinedBytes {
-                    bytes: declined_bytes,
-                }),
+                TracedMsg::new(
+                    PeerMsg::CasualMessage(CasualMessage::CompactionDeclinedBytes {
+                        bytes: declined_bytes,
+                    }),
+                    "PeerMsg::CasualMessage::CompactionDeclinedBytes",
+                ),
             );
         }
     }
@@ -1993,13 +2080,17 @@ impl<'a, EK: KvEngine, ER: RaftEngine, T: Transport> StoreFsmDelegate<'a, EK, ER
                 "store_id" => self.fsm.store.id,
                 "region_id" => region_id,
             );
-            let gc_snap = PeerMsg::CasualMessage(CasualMessage::GcSnap { snaps });
+            let gc_snap = TracedMsg::new(
+                PeerMsg::CasualMessage(CasualMessage::GcSnap { snaps }),
+                "PeerMsg::CasualMessage::GcSnap",
+            );
             match self.ctx.router.send(region_id, gc_snap) {
                 Ok(()) => Ok(()),
                 Err(TrySendError::Disconnected(_)) if self.ctx.router.is_shutdown() => Ok(()),
-                Err(TrySendError::Disconnected(PeerMsg::CasualMessage(
-                    CasualMessage::GcSnap { snaps },
-                ))) => {
+                Err(TrySendError::Disconnected(TracedMsg {
+                    msg: PeerMsg::CasualMessage(CasualMessage::GcSnap { snaps }),
+                    ..
+                })) => {
                     // The snapshot exists because MsgAppend has been rejected. So the
                     // peer must have been exist. But now it's disconnected, so the peer
                     // has to be destroyed instead of being created.
@@ -2259,7 +2350,10 @@ impl<'a, EK: KvEngine, ER: RaftEngine, T: Transport> StoreFsmDelegate<'a, EK, ER
 
         let _ = self.ctx.router.send(
             target_region_id,
-            PeerMsg::RaftCommand(RaftCommand::new(request, Callback::None)),
+            TracedMsg::new(
+                PeerMsg::RaftCommand(RaftCommand::new(request, Callback::None)),
+                "PeerMsg::RaftCommand",
+            ),
         );
     }
 
@@ -2297,7 +2391,10 @@ impl<'a, EK: KvEngine, ER: RaftEngine, T: Transport> StoreFsmDelegate<'a, EK, ER
         for region_id in regions {
             let _ = self.ctx.router.send(
                 region_id,
-                PeerMsg::CasualMessage(CasualMessage::ClearRegionSize),
+                TracedMsg::new(
+                    PeerMsg::CasualMessage(CasualMessage::ClearRegionSize),
+                    "PeerMsg::CasualMessage::ClearRegionSize",
+                ),
             );
         }
     }
