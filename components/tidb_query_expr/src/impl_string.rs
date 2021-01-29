@@ -702,19 +702,35 @@ pub fn instr_utf8(s: BytesRef, substr: BytesRef) -> Result<Option<Int>> {
 
 #[rpn_fn]
 #[inline]
-pub fn find_in_set(s: BytesRef, str_list: BytesRef) -> Result<Option<Int>> {
+pub fn find_in_set<C: Collator>(s: BytesRef, str_list: BytesRef) -> Result<Option<Int>> {
     if str_list.is_empty() {
         return Ok(Some(0));
     }
-
-    let s = String::from_utf8_lossy(s);
-    let result = String::from_utf8_lossy(str_list)
-        .split(',')
-        .position(|str_in_set| str_in_set == s)
-        .map(|p| p as i64 + 1)
-        .or(Some(0));
-
-    Ok(result)
+    // `r_idx` and `l_idx` help to extract contents between `,`.
+    let (mut r_idx, mut l_idx) = (0, 0);
+    let mut cnt = 0;
+    while l_idx < str_list.len() {
+        if let Some((c, offset)) = C::Charset::decode_one(&str_list[l_idx..]) {
+            let code: u32 = c.into();
+            if code == ',' as u32 {
+                if let Ok(std::cmp::Ordering::Equal) =
+                    C::sort_compare(&s[..], &str_list[r_idx..l_idx])
+                {
+                    return Ok(Some(cnt + 1));
+                }
+                cnt += 1;
+                l_idx += offset;
+                r_idx = l_idx;
+            } else {
+                l_idx += offset;
+            }
+        }
+    }
+    // check the last part if the str_list is not end with `,`.
+    if let Ok(std::cmp::Ordering::Equal) = C::sort_compare(&s[..], &str_list[r_idx..l_idx]) {
+        return Ok(Some(cnt + 1));
+    }
+    Ok(Some(0))
 }
 
 #[rpn_fn(writer)]
@@ -3236,6 +3252,59 @@ mod tests {
                 .evaluate::<Int>(ScalarFuncSig::FindInSet)
                 .unwrap();
             assert_eq!(got, exp);
+        }
+    }
+
+    #[test]
+    fn test_find_in_set_with_collation() {
+        let cases = vec![
+            ("foo", "foo,bar", Collation::Binary, 1),
+            ("foo", "foo,bar", Collation::Utf8Mb4Bin, 1),
+            ("Foo", "foO,bar", Collation::Binary, 0),
+            ("Foo", "foO,bar", Collation::Utf8Mb4Bin, 0),
+            ("Foo", "foO,bar", Collation::Utf8Mb4GeneralCi, 1),
+            ("foo", "foobar,bar", Collation::Binary, 0),
+            ("foo", "foobar,bar", Collation::Utf8Mb4Bin, 0),
+            (" foo ", "foo, foo ", Collation::Binary, 2),
+            (" foo ", "foo, foo ", Collation::Utf8Mb4Bin, 2),
+            ("", "foo,bar,", Collation::Binary, 3),
+            ("", "foo,bar,", Collation::Utf8Mb4Bin, 3),
+            ("", ",foo,bar,", Collation::Binary, 1),
+            ("", ",foo,bar,", Collation::Utf8Mb4Bin, 1),
+            ("", "", Collation::Binary, 0),
+            ("", "", Collation::Utf8Mb4Bin, 0),
+            ("a,b", "a,b,c", Collation::Binary, 0),
+            ("a,b", "a,b,c", Collation::Utf8Mb4Bin, 0),
+            // content for utf8
+            ("世界", "你好,世界", Collation::Binary, 2),
+            ("世界", "你好,世界", Collation::Utf8Mb4Bin, 2),
+            (" 世界 ", "foo, 世界 ", Collation::Binary, 2),
+            (" 世界 ", "foo, 世界 ", Collation::Utf8Mb4Bin, 2),
+            ("世", "你好,世界", Collation::Binary, 0),
+            ("世", "你好,世界", Collation::Utf8Mb4Bin, 0),
+            ("", "你好,世界,", Collation::Binary, 3),
+            ("", "你好,世界,", Collation::Utf8Mb4Bin, 3),
+            ("", ",你好,世界,", Collation::Binary, 1),
+            ("", ",你好,世界,", Collation::Utf8Mb4Bin, 1),
+            ("你好,世界", "你好,世界,!", Collation::Binary, 0),
+            ("你好,世界", "你好,世界,!", Collation::Utf8Mb4Bin, 0),
+        ];
+
+        for (s, str_list, collation, exp) in cases {
+            let s = Some(s.as_bytes().to_vec());
+            let str_list = Some(str_list.as_bytes().to_vec());
+            let got = RpnFnScalarEvaluator::new()
+                .return_field_type(
+                    FieldTypeBuilder::new()
+                        .tp(FieldTypeTp::LongLong)
+                        .collation(collation)
+                        .build(),
+                )
+                .push_param(s)
+                .push_param(str_list)
+                .evaluate::<Int>(ScalarFuncSig::FindInSet)
+                .unwrap();
+            assert_eq!(got, Some(exp));
         }
     }
 
