@@ -4,6 +4,7 @@ use std::{iter, str};
 use tidb_query_codegen::rpn_fn;
 
 use crate::impl_math::i64_to_usize;
+use bstr::ByteSlice;
 use tidb_query_common::Result;
 use tidb_query_datatype::codec::collation::*;
 use tidb_query_datatype::codec::data_type::*;
@@ -706,31 +707,17 @@ pub fn find_in_set<C: Collator>(s: BytesRef, str_list: BytesRef) -> Result<Optio
     if str_list.is_empty() {
         return Ok(Some(0));
     }
-    // `r_idx` and `l_idx` help to extract contents between `,`.
-    let (mut r_idx, mut l_idx) = (0, 0);
-    let mut cnt = 0;
-    while l_idx < str_list.len() {
-        if let Some((c, offset)) = C::Charset::decode_one(&str_list[l_idx..]) {
-            let code: u32 = c.into();
-            if code == ',' as u32 {
-                if let Ok(std::cmp::Ordering::Equal) =
-                    C::sort_compare(&s[..], &str_list[r_idx..l_idx])
-                {
-                    return Ok(Some(cnt + 1));
-                }
-                cnt += 1;
-                l_idx += offset;
-                r_idx = l_idx;
-            } else {
-                l_idx += offset;
-            }
-        }
-    }
-    // check the last part if the str_list is not end with `,`.
-    if let Ok(std::cmp::Ordering::Equal) = C::sort_compare(&s[..], &str_list[r_idx..l_idx]) {
-        return Ok(Some(cnt + 1));
-    }
-    Ok(Some(0))
+    let result = str_list
+        .split_str(",")
+        .position(|str_in_set| {
+            C::sort_compare(&s[..], str_in_set)
+                .ok()
+                .filter(|&order| order == std::cmp::Ordering::Equal)
+                .is_some()
+        })
+        .map(|p| p as i64 + 1)
+        .or(Some(0));
+    Ok(result)
 }
 
 #[rpn_fn(writer)]
