@@ -158,10 +158,13 @@ pub fn bit_length(arg: BytesRef) -> Result<Option<i64>> {
 
 #[rpn_fn(nullable)]
 #[inline]
-pub fn ord(arg: Option<BytesRef>) -> Result<Option<i64>> {
+pub fn ord<C: Collator>(arg: Option<BytesRef>) -> Result<Option<i64>> {
     let mut result = 0;
     if let Some(content) = arg {
-        let size = bstr::decode_utf8(content).1;
+        let size = match C::Charset::decode_one(content) {
+            Some((_, size)) => size,
+            None => 0,
+        };
         let bytes = &content[..size];
         let mut factor = 1;
 
@@ -1708,6 +1711,37 @@ mod tests {
 
         for (arg, expect_output) in cases {
             let output = RpnFnScalarEvaluator::new()
+                .push_param(arg.map(|s| s.as_bytes().to_vec()))
+                .evaluate(ScalarFuncSig::Ord)
+                .unwrap();
+            assert_eq!(output, expect_output);
+        }
+    }
+
+    #[test]
+    fn test_ord_with_collation() {
+        let cases = vec![
+            (Some("2"), Collation::Latin1Bin, Some(50i64)),
+            (Some("23"), Collation::Latin1Bin, Some(50i64)),
+            (Some("2.3"), Collation::Latin1Bin, Some(50i64)),
+            (Some(""), Collation::Latin1Bin, Some(0i64)),
+            // the following ord value is from mysql8.0 under `latin1_bin`
+            (Some("你好"), Collation::Latin1Bin, Some(228i64)),
+            (Some("にほん"), Collation::Latin1Bin, Some(227i64)),
+            (Some("한국"), Collation::Latin1Bin, Some(237i64)),
+            (Some("👍"), Collation::Latin1Bin, Some(240i64)),
+            (Some("א"), Collation::Latin1Bin, Some(215i64)),
+            (None, Collation::Binary, Some(0)),
+        ];
+
+        for (arg, collation, expect_output) in cases {
+            let output = RpnFnScalarEvaluator::new()
+                .return_field_type(
+                    FieldTypeBuilder::new()
+                        .tp(FieldTypeTp::LongLong)
+                        .collation(collation)
+                        .build(),
+                )
                 .push_param(arg.map(|s| s.as_bytes().to_vec()))
                 .evaluate(ScalarFuncSig::Ord)
                 .unwrap();
