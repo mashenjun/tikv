@@ -279,6 +279,7 @@ pub fn add_datetime_and_duration(
     datetime: &DateTime,
     duration: &Duration,
 ) -> Result<Option<DateTime>> {
+    println!("datetime {:?}", datetime);
     let mut res = match datetime.checked_add(ctx, *duration) {
         Some(res) => res,
         None => {
@@ -630,6 +631,25 @@ pub fn add_duration_and_string(
         }
     };
     Ok(Some(res))
+}
+
+#[rpn_fn(writer, capture = [ctx])]
+#[inline]
+pub fn add_date_and_string(ctx: &mut EvalContext, arg1: &Duration, arg2: BytesRef, writer: BytesWriter,) -> Result<BytesGuard> {
+    let arg2 = std::str::from_utf8(&arg2).map_err(Error::Encoding)?;
+    if let Ok(dur) = Duration::parse_exactly(ctx, arg2, MAX_FSP) {
+        return match arg1.checked_add(dur) {
+            Some(result) =>
+                {
+                    Ok(writer.write(Some(result.to_string().into_bytes())))
+                },
+            None => ctx
+                .handle_overflow_err(Error::overflow("DURATION", &format!("{} + {}", arg1, arg2)))
+                .map(|_| Ok(writer.write(None)))?,
+        };
+    }
+    ctx.handle_invalid_time_error(Error::incorrect_datetime_value(arg2))?;
+    Ok(writer.write(None))
 }
 
 /// Cast Duration into string representation and drop subsec if possible.
@@ -1648,6 +1668,7 @@ mod tests {
             let time = time.map(|t| DateTime::parse_datetime(&mut ctx, t, 6, true).unwrap());
             let output = RpnFnScalarEvaluator::new()
                 .push_param(time)
+
                 .evaluate(ScalarFuncSig::Year)
                 .unwrap();
             assert_eq!(output, expect);
@@ -1903,6 +1924,73 @@ mod tests {
                 )
                 .evaluate::<Duration>(ScalarFuncSig::MakeTime);
             assert!(output.is_err());
+        }
+    }
+
+    #[test]
+    fn test_add_date_and_string() {
+        let mut ctx = EvalContext::default();
+        // normal cases
+        let cases = vec![
+            (Some("01:00:00.999999"), Some("02:00:00.999998"), Some("03:00:01.999997")),
+            (Some("23:59:59.000000"), Some("00:00:01"), Some("24:00:00.000000")),
+            (Some("110:00:00.000000"), Some("1 02:00:00"), Some("136:00:00.000000")),
+            (Some("-110:00:00.000000"), Some("1 02:00:00"), Some("-84:00:00.000000")),
+            (Some("00:00:01.000000"), Some("-00:00:01"), Some("00:00:00.000000")),
+            (Some("00:00:03.000000"), Some("-00:00:01"), Some("00:00:02.000000")),
+        ];
+        for (arg_dur, arg_str, exp) in cases {
+            let exp = exp.map(|str| str.as_bytes().to_vec());
+            let arg_dur = match arg_dur {
+                Some(arg_dur) => {
+                    Some(Duration::parse_exactly(& mut ctx, arg_dur, MAX_FSP).unwrap())
+                }
+                None => Some(Duration::zero()),
+            };
+            let arg_str = arg_str.map(|str| str.as_bytes().to_vec());
+            let output = RpnFnScalarEvaluator::new()
+                .push_param(arg_dur)
+                .push_param(arg_str)
+                .evaluate(ScalarFuncSig::AddDateAndString)
+                .unwrap();
+            assert_eq!(output, exp);
+        }
+
+        let zero_dur = Duration::zero();
+        let zero_dur_string = zero_dur.to_string();
+        let cases = vec![
+            (
+                None,
+                Some("11:30:45.123456"),
+                None,
+            ),
+            (None,None,None),
+            (
+                Some(zero_dur),
+                Some(zero_dur_string.as_str()),
+                Some("00:00:00.000000"),
+            ),
+            (
+                Some(Duration::parse(&mut ctx, "01:00:00", 6).unwrap()),
+                Some(zero_dur_string.as_str()),
+                Some("01:00:00.000000"),
+            ),
+            (
+                Some(Duration::parse(&mut ctx, "01:00:00", 6).unwrap()),
+                Some("-01:00:00"),
+                Some("00:00:00.000000"),
+            )
+        ];
+
+        for (arg_dur, arg_str, exp) in cases {
+            let exp = exp.map(|str| str.as_bytes().to_vec());
+            let arg_str = arg_str.map(|str| str.as_bytes().to_vec());
+            let output = RpnFnScalarEvaluator::new()
+                .push_param(arg_dur)
+                .push_param(arg_str)
+                .evaluate(ScalarFuncSig::AddDateAndString)
+                .unwrap();
+            assert_eq!(output, exp);
         }
     }
 }
