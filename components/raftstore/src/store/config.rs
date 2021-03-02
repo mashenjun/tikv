@@ -319,9 +319,9 @@ impl Config {
         if self.raft_log_gc_size_limit.0 == 0 {
             return Err(box_err!("raft log gc size limit should large than 0."));
         }
-
-        let election_timeout =
-            self.raft_base_tick_interval.as_millis() * self.raft_election_timeout_ticks as u64;
+        // TODO: change the validating formula
+        let election_timeout = self.raft_base_tick_interval.as_millis()
+            * (self.raft_election_timeout_ticks - 1) as u64;
         let lease = self.raft_store_max_leader_lease.as_millis() as u64;
         if election_timeout < lease {
             return Err(box_err!(
@@ -718,5 +718,25 @@ mod tests {
         cfg = Config::new();
         cfg.future_poll_size = 0;
         assert!(cfg.validate().is_err());
+
+        // corner case for lease duration and election timeout
+        // we assume the `randomize_election_timeout` is assigned to `raft_min_election_timeout_ticks`
+        cfg = Config::new();
+        cfg.raft_base_tick_interval = ReadableDuration::secs(2);
+        cfg.raft_store_max_leader_lease = ReadableDuration::secs(10);
+        cfg.raft_election_timeout_ticks = 5;
+        assert!(cfg.validate().is_err());
+
+        cfg = Config::new();
+        cfg.raft_base_tick_interval = ReadableDuration::secs(2);
+        cfg.raft_store_max_leader_lease = ReadableDuration::secs(9);
+        cfg.raft_election_timeout_ticks = 5;
+        assert!(cfg.validate().is_err());
+
+        cfg = Config::new();
+        cfg.raft_base_tick_interval = ReadableDuration::secs(2);
+        cfg.raft_store_max_leader_lease = ReadableDuration::secs(8);
+        cfg.raft_election_timeout_ticks = 5;
+        assert!(cfg.validate().is_ok());
     }
 }

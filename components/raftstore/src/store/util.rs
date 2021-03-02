@@ -448,6 +448,7 @@ impl Lease {
     /// The valid leader lease should be `lease = max_lease - (commit_ts - send_ts)`
     /// And the expired timestamp for that leader lease is `commit_ts + lease`,
     /// which is `send_ts + max_lease` in short.
+    /// TODO: change the formula?
     fn next_expired_time(&self, send_ts: Timespec) -> Timespec {
         send_ts + self.max_lease
     }
