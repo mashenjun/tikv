@@ -110,6 +110,7 @@ impl<T: Display + Send> Scheduler<T> {
     /// If the worker is stopped or number pending tasks exceeds capacity, an error will return.
     pub fn schedule(&self, task: T) -> Result<(), ScheduleError<T>> {
         debug!("scheduling task {}", task);
+        eprintln!("10-> equal to time point 9");
         if self.counter.load(Ordering::Acquire) >= self.pending_capacity {
             return Err(ScheduleError::Full(task));
         }

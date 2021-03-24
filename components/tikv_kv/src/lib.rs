@@ -450,6 +450,7 @@ pub fn snapshot<E: Engine>(
         let (_ctx, result) = future
             .map_err(|cancel| Error::from(ErrorInner::Other(box_err!(cancel))))
             .await?;
+        eprintln!("13-> rvc snapshot from engine");
         fail_point!("after-snapshot");
         result
     }

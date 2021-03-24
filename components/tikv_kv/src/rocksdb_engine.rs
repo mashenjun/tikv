@@ -258,6 +258,7 @@ impl Engine for RocksEngine {
     }
 
     fn async_snapshot(&self, _: SnapContext<'_>, cb: Callback<Self::Snap>) -> Result<()> {
+
         fail_point!("rockskv_async_snapshot", |_| Err(box_err!(
             "snapshot failed"
         )));
@@ -272,6 +273,7 @@ impl Engine for RocksEngine {
         if self.not_leader.load(Ordering::SeqCst) {
             return Err(Error::from(ErrorInner::Request(not_leader)));
         }
+        eprintln!("9-> engine send get snapshot task to worker");
         box_try!(self.sched.schedule(Task::Snapshot(cb)));
         Ok(())
     }

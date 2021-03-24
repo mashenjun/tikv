@@ -69,6 +69,7 @@ impl KvEngine for RocksEngine {
     type Snapshot = RocksSnapshot;
 
     fn snapshot(&self) -> RocksSnapshot {
+        eprintln!("11-> worker rvc snapshot task and process it");
         RocksSnapshot::new(self.db.clone())
     }
 

@@ -78,7 +78,7 @@ use concurrency_manager::ConcurrencyManager;
 use engine_traits::{CfName, CF_DEFAULT, DATA_CFS};
 use futures::prelude::*;
 use kvproto::kvrpcpb::{
-    CommandPri, Context, GetRequest, IsolationLevel, KeyRange, LockInfo, RawGetRequest,
+    CommandPri, Context, GetRequest, IsolationLevel, KeyRange, LockInfo, RawGetRequest, TimeDetail
 };
 use raftstore::store::util::build_key_range;
 use rand::prelude::*;
@@ -87,8 +87,9 @@ use std::{
     iter,
     sync::{atomic, Arc},
 };
-use tikv_util::time::{Instant, ThreadReadId};
+use tikv_util::time::{Instant, ThreadReadId, duration_to_ms};
 use txn_types::{Key, KvPair, Lock, Mutation, TimeStamp, TsSet, Value};
+use std::time::Duration;
 
 pub type Result<T> = std::result::Result<T, Error>;
 pub type Callback<T> = Box<dyn FnOnce(Result<T>) + Send>;
@@ -237,6 +238,7 @@ impl<E: Engine, L: LockManager> Storage<E, L> {
         engine: &E,
         ctx: SnapContext<'_>,
     ) -> impl std::future::Future<Output = Result<E::Snap>> {
+        eprintln!("7-> call engine to get snapshot");
         kv::snapshot(engine, ctx)
             .map_err(txn::Error::from)
             .map_err(Error::from)
@@ -299,12 +301,13 @@ impl<E: Engine, L: LockManager> Storage<E, L> {
         mut ctx: Context,
         key: Key,
         start_ts: TimeStamp,
-    ) -> impl Future<Output = Result<(Option<Value>, Statistics, PerfStatisticsDelta)>> {
+    ) -> impl Future<Output = Result<(Option<Value>, Statistics, PerfStatisticsDelta, Tracker)>> {
+        eprintln!("2-> get value is called");
         const CMD: CommandKind = CommandKind::get;
         let priority = ctx.get_priority();
         let priority_tag = get_priority_tag(priority);
         let concurrency_manager = self.concurrency_manager.clone();
-
+        eprintln!("3-> hand off get value task to runtime");
         let res = self.read_pool.spawn_handle(
             async move {
                 tls_collect_qps(
@@ -334,8 +337,10 @@ impl<E: Engine, L: LockManager> Storage<E, L> {
                     &concurrency_manager,
                     CMD,
                 )?;
+                eprintln!("6-> hand off on get snapshot task to runtime");
                 let snapshot =
                     Self::with_tls_engine(|engine| Self::snapshot(engine, snap_ctx)).await?;
+                eprintln!("14-> finish get snapshot");
                 {
                     let begin_instant = Instant::now_coarse();
                     let mut statistics = Statistics::default();
@@ -348,6 +353,7 @@ impl<E: Engine, L: LockManager> Storage<E, L> {
                         bypass_locks,
                         false,
                     );
+                    eprintln!("15-> start scan on snapshot");
                     let result = snap_store
                         .get(&key, &mut statistics)
                         // map storage::txn::Error -> storage::Error
@@ -356,22 +362,27 @@ impl<E: Engine, L: LockManager> Storage<E, L> {
                             KV_COMMAND_KEYREAD_HISTOGRAM_STATIC.get(CMD).observe(1_f64);
                             r
                         });
-
+                    eprintln!("16-> finish scan on snapshot");
                     metrics::tls_collect_scan_details(CMD, &statistics);
                     metrics::tls_collect_read_flow(ctx.get_region_id(), &statistics);
+                    let elapsed_from_begin = begin_instant.elapsed();
                     SCHED_PROCESSING_READ_HISTOGRAM_STATIC
                         .get(CMD)
-                        .observe(begin_instant.elapsed_secs());
+                        .observe(elapsed_from_begin.as_secs_f64());
                     SCHED_HISTOGRAM_VEC_STATIC
                         .get(CMD)
                         .observe(command_duration.elapsed_secs());
-
-                    Ok((result?, statistics, perf_statistics.delta()))
+                    let tracker = Tracker {
+                        snapshot_ready_at: begin_instant.clone(),
+                        process_wall_time: elapsed_from_begin.clone(),
+                    };
+                    Ok((result?, statistics, perf_statistics.delta(), tracker))
                 }
             },
             priority,
             thread_rng().next_u64(),
         );
+        eprintln!("4-> hand off get value task done");
         async move {
             res.map_err(|_| Error::from(ErrorInner::SchedTooBusy))
                 .await?
@@ -1924,6 +1935,12 @@ pub mod test_util {
             .unwrap();
         rx.recv().unwrap();
     }
+}
+
+#[derive(Debug)]
+pub struct Tracker{
+    pub snapshot_ready_at: Instant,
+    pub process_wall_time: Duration,
 }
 
 #[cfg(test)]

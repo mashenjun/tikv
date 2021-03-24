@@ -1,7 +1,7 @@
 // Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::sync::Arc;
-use tikv_util::time::{duration_to_sec, Instant};
+use tikv_util::time::{duration_to_sec, Instant, duration_to_ms};
 
 use super::batch::ReqBatcher;
 use crate::coprocessor::Endpoint;
@@ -1221,23 +1221,29 @@ fn future_get<E: Engine, L: LockManager>(
     storage: &Storage<E, L>,
     mut req: GetRequest,
 ) -> impl Future<Output = ServerResult<GetResponse>> {
+    let begin = Instant::now_coarse();
+    eprintln!("1-> gRPC method is called");
     let v = storage.get(
         req.take_context(),
         Key::from_raw(req.get_key()),
         req.get_version().into(),
     );
-
+    eprintln!("5-> hand off process task done");
     async move {
+        // TODO: want to control the process duration in test case.
         let v = v.await;
+        eprintln!("18-> get scan res");
         let mut resp = GetResponse::default();
         if let Some(err) = extract_region_error(&v) {
             resp.set_region_error(err);
         } else {
             match v {
-                Ok((val, statistics, perf_statistics_delta)) => {
+                Ok((val, statistics, perf_statistics_delta, tracker)) => {
                     let scan_detail_v2 = resp.mut_exec_details_v2().mut_scan_detail_v2();
                     statistics.write_scan_detail(scan_detail_v2);
                     perf_statistics_delta.write_scan_detail(scan_detail_v2);
+                    resp.mut_exec_details_v2().mut_time_detail().set_process_wall_time_ms(duration_to_ms(tracker.process_wall_time) as i64);
+                    resp.mut_exec_details_v2().mut_time_detail().set_wait_wall_time_ms(duration_to_ms( tracker.snapshot_ready_at.duration_since(begin)) as i64);
                     match val {
                         Some(val) => resp.set_value(val),
                         None => resp.set_not_found(true),
@@ -1246,6 +1252,8 @@ fn future_get<E: Engine, L: LockManager>(
                 Err(e) => resp.set_error(extract_key_error(&e)),
             }
         }
+        // resp.mut_exec_details_v2().mut_time_detail().set_process_wall_time_ms(duration_to_ms(process_start_at.elapsed()) as i64);
+        // resp.mut_exec_details_v2().mut_time_detail().set_wait_wall_time_ms(duration_to_ms(process_start_at.duration_since(begin)) as i64);
         Ok(resp)
     }
 }
@@ -1985,6 +1993,11 @@ mod tests {
     use futures::channel::oneshot;
     use futures::executor::block_on;
     use std::thread;
+    use crate::storage::{TestStorageBuilder, TestEngineBuilder};
+    use crate::storage::lock_manager::DummyLockManager;
+    use std::time::Duration;
+    use crate::storage::kv::{SnapContext, Modify, WriteData, Result, Callback, ExtCallback};
+    use kvproto::kvrpcpb::Context;
 
     #[test]
     fn test_poll_future_notify_with_slow_source() {
@@ -2031,5 +2044,53 @@ mod tests {
         };
         poll_future_notify(task);
         assert_eq!(block_on(rx1).unwrap(), 200);
+    }
+
+    #[test]
+    fn test_response_with_time() {
+        #[derive(Clone)]
+        struct DelayEngine<E:Engine>(E);
+
+        impl<E:Engine> Engine for DelayEngine<E> {
+            type Snap = E::Snap;
+            type Local = E::Local;
+
+            fn kv_engine(&self) -> Self::Local {
+                self.0.kv_engine()
+            }
+
+            fn snapshot_on_kv_engine(&self, start_key: &[u8], end_key: &[u8]) -> Result<Self::Snap> {
+                self.0.snapshot_on_kv_engine(start_key, end_key)
+            }
+
+            fn modify_on_kv_engine(&self, modifies: Vec<Modify>) -> Result<()> {
+                self.0.modify_on_kv_engine(modifies)
+            }
+
+            fn async_snapshot(&self, ctx: SnapContext<'_>, cb: Callback<Self::Snap>) -> Result<()> {
+                thread::sleep(Duration::from_millis(1000));
+                self.0.async_snapshot(ctx, cb)
+            }
+
+            fn async_write(&self, ctx: &Context, batch: WriteData, write_cb: Callback<()>) -> Result<()> {
+                self.0.async_write(ctx, batch, write_cb)
+            }
+
+            fn async_write_ext(&self, ctx: &Context, batch: WriteData, write_cb: Callback<()>, _proposed_cb: Option<ExtCallback>, _committed_cb: Option<ExtCallback>) -> Result<()> {
+                self.0.async_write_ext(ctx, batch, write_cb, _proposed_cb, _committed_cb)
+            }
+        }
+
+        // construct a delayable storage engine for testing
+        let engine = TestEngineBuilder::new().ttl(false).build().unwrap();
+        let storage = TestStorageBuilder::from_engine_and_lock_mgr(DelayEngine(engine), DummyLockManager{}).build().unwrap();
+        let req = GetRequest::default();
+        let resp_fut = future_get(&storage, req);
+        thread::sleep(Duration::from_millis(100));
+        let resp = block_on(resp_fut).unwrap();
+        assert!(resp.has_exec_details_v2());
+        assert_ge!(resp.get_exec_details_v2().get_time_detail().get_wait_wall_time_ms(),0);
+        assert_ge!(resp.get_exec_details_v2().get_time_detail().get_process_wall_time_ms(),0);
+        eprintln!("{:?}", resp);
     }
 }
